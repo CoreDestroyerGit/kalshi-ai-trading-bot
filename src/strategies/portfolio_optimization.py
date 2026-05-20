@@ -627,6 +627,12 @@ class AdvancedPortfolioOptimizer:
         try:
             constrained_allocation = {}
             total_allocation = 0.0
+            # Prevent "all allocations removed" when portfolio capital is small.
+            # Keep configured floor for larger books, but scale down for small balances.
+            effective_min_position_size = min(
+                float(self.min_position_size),
+                max(0.5, float(self.total_capital) * 0.02)
+            )
             
             for market_id, fraction in allocation.items():
                 # Find the opportunity
@@ -636,7 +642,7 @@ class AdvancedPortfolioOptimizer:
                 
                 # Apply minimum position size
                 dollar_allocation = fraction * self.total_capital
-                if dollar_allocation < self.min_position_size:
+                if dollar_allocation < effective_min_position_size:
                     continue
                 
                 # Apply maximum position fraction
@@ -655,6 +661,10 @@ class AdvancedPortfolioOptimizer:
                     break
             
             self.logger.info(f"Risk constraints applied. Total allocation: {total_allocation:.3f}")
+            self.logger.info(
+                f"Risk constraint thresholds: min_position_size=${effective_min_position_size:.2f}, "
+                f"max_position_fraction={self.max_position_fraction:.3f}, total_capital=${self.total_capital:.2f}"
+            )
             self.logger.info(f"Final constrained allocations: {constrained_allocation}")
             
             return constrained_allocation
@@ -878,7 +888,7 @@ async def create_market_opportunities_from_markets(
             edge_result = EdgeFilter.calculate_edge(predicted_prob, market_prob, confidence)
             
             min_edge_pct = float(getattr(settings.trading, "min_edge_percentage_filter", 0.05))
-            if edge_result.edge_percentage >= min_edge_pct:
+            if edge_result.passes_filter and edge_result.edge_percentage >= min_edge_pct:
                 opportunity = MarketOpportunity(
                     market_id=market.market_id,
                     market_title=market.title,
@@ -918,7 +928,8 @@ async def create_market_opportunities_from_markets(
             else:
                 logger.info(
                     f"❌ EDGE FILTERED: {market.market_id} - "
-                    f"edge={edge_result.edge_percentage:.1%} < min={min_edge_pct:.1%}; "
+                    f"passes_filter={edge_result.passes_filter}, "
+                    f"edge={edge_result.edge_percentage:.1%}, min={min_edge_pct:.1%}; "
                     f"{edge_result.reason}"
                 )
             
