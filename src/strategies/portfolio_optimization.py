@@ -944,7 +944,7 @@ async def _evaluate_immediate_trade(
                 'volume': getattr(opportunity, 'volume', 1000),
                 'min_volume': 1000,
                 'time_to_expiry_days': opportunity.time_to_expiry,
-                'max_time_to_expiry': 365
+                'max_time_to_expiry': settings.trading.max_time_to_expiry_days
             }
         )
         
