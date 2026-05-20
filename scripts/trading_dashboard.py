@@ -229,7 +229,8 @@ def load_llm_data():
         st.error(f"Error loading LLM data: {e}")
         return [], {}
 
-@st.cache_data(ttl=300)  # Cache for 5 minutes
+# Keep this near-real-time; stale cache was masking live position changes.
+@st.cache_data(ttl=30)
 def load_system_health():
     """Load system health metrics including both available cash and total portfolio value."""
     try:
@@ -246,9 +247,12 @@ def load_system_health():
             try:
                 balance_response = await kalshi_client.get_balance()
                 available_cash = balance_response.get('balance', 0) / 100
+                # Kalshi v2 often includes portfolio value directly (in cents).
+                portfolio_value_cents = balance_response.get('portfolio_value', 0)
             except Exception as exc:
                 st.warning(f"Live balance unavailable, using fallback values: {exc}")
                 available_cash = 0.0
+                portfolio_value_cents = 0
 
             # Get current positions (prefer live Kalshi; fallback to DB open positions).
             try:
@@ -266,7 +270,8 @@ def load_system_health():
                 ]
                 live_source = False
 
-            total_position_value = 0.0
+            # Prefer direct Kalshi portfolio_value when present.
+            total_position_value = (portfolio_value_cents / 100.0) if portfolio_value_cents else 0.0
             positions_count = len([
                 p for p in market_positions
                 if (p.get('position', 0) != 0) or (float(p.get('event_exposure_dollars', 0) or 0) != 0)
@@ -284,6 +289,9 @@ def load_system_health():
                     if ticker and position_count != 0:
                         if not live_source:
                             total_position_value += abs(position_count) * float(position.get("entry_price", 0.0))
+                            continue
+                        if portfolio_value_cents:
+                            # Already have authoritative position value from balance response.
                             continue
                         # event_positions already include exposure dollars; use it directly.
                         if 'event_exposure_dollars' in position and position.get('position', 0) == 0:
