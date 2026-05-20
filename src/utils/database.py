@@ -594,8 +594,8 @@ class DatabaseManager(TradingLoggerMixin):
             if has_strategy_in_trades:
                 # Get stats from completed trades (trade_logs)
                 cursor = await db.execute("""
-                    SELECT 
-                        strategy,
+                    SELECT
+                        COALESCE(strategy, 'unknown') as strategy,
                         COUNT(*) as trade_count,
                         SUM(pnl) as total_pnl,
                         AVG(pnl) as avg_pnl,
@@ -603,9 +603,8 @@ class DatabaseManager(TradingLoggerMixin):
                         SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) as losing_trades,
                         MAX(pnl) as best_trade,
                         MIN(pnl) as worst_trade
-                    FROM trade_logs 
-                    WHERE strategy IS NOT NULL
-                    GROUP BY strategy
+                    FROM trade_logs
+                    GROUP BY COALESCE(strategy, 'unknown')
                 """)
                 completed_stats = await cursor.fetchall()
             else:
@@ -637,13 +636,13 @@ class DatabaseManager(TradingLoggerMixin):
             if has_strategy_in_positions:
                 # Get current open positions by strategy
                 cursor = await db.execute("""
-                    SELECT 
-                        strategy,
+                    SELECT
+                        COALESCE(strategy, 'unknown') as strategy,
                         COUNT(*) as open_positions,
                         SUM(quantity * entry_price) as capital_deployed
-                    FROM positions 
-                    WHERE status = 'open' AND strategy IS NOT NULL
-                    GROUP BY strategy
+                    FROM positions
+                    WHERE status = 'open'
+                    GROUP BY COALESCE(strategy, 'unknown')
                 """)
                 open_stats = await cursor.fetchall()
             else:
