@@ -12,6 +12,7 @@ build it for real (see src/agents/ for the runner skeletons).
 import asyncio
 import time
 import numpy as np
+import aiosqlite
 from typing import Optional, Dict, Any
 from datetime import datetime
 
@@ -62,6 +63,73 @@ def _calculate_dynamic_quantity(
     )
     
     return quantity
+
+
+async def _calibrate_confidence_from_history(
+    db_manager: DatabaseManager,
+    raw_confidence: float,
+) -> float:
+    """
+    Calibrate model confidence using recent realized outcomes.
+
+    Uses historical closed trades (joined to positions for stored confidence),
+    computes empirical win-rate by confidence bin, then blends raw confidence
+    with empirical confidence for better reliability.
+    """
+    try:
+        async with aiosqlite.connect(db_manager.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT p.confidence AS model_confidence, tl.pnl AS pnl
+                FROM trade_logs tl
+                JOIN positions p
+                  ON p.market_id = tl.market_id
+                 AND p.side = tl.side
+                WHERE p.confidence IS NOT NULL
+                ORDER BY tl.exit_timestamp DESC
+                LIMIT 400
+                """
+            )
+            rows = await cursor.fetchall()
+
+        if len(rows) < 30:
+            return raw_confidence
+
+        bins: dict[int, list[int]] = {}
+        wins = 0
+        for r in rows:
+            c = float(r["model_confidence"])
+            pnl = float(r["pnl"])
+            is_win = 1 if pnl > 0 else 0
+            wins += is_win
+            bucket = int(max(0, min(9, c * 10)))
+            bins.setdefault(bucket, []).append(is_win)
+
+        target_bucket = int(max(0, min(9, raw_confidence * 10)))
+        empirical = None
+        min_samples = 12
+
+        if target_bucket in bins and len(bins[target_bucket]) >= min_samples:
+            empirical = sum(bins[target_bucket]) / len(bins[target_bucket])
+        else:
+            for radius in range(1, 5):
+                neighbors = []
+                for b in (target_bucket - radius, target_bucket + radius):
+                    if b in bins:
+                        neighbors.extend(bins[b])
+                if len(neighbors) >= min_samples:
+                    empirical = sum(neighbors) / len(neighbors)
+                    break
+
+        if empirical is None:
+            empirical = wins / len(rows)
+
+        # Blend to reduce overfitting/noise from small samples.
+        calibrated = (0.7 * raw_confidence) + (0.3 * empirical)
+        return max(0.01, min(0.99, calibrated))
+    except Exception:
+        return raw_confidence
 
 
 async def make_decision_for_market(
@@ -278,11 +346,12 @@ async def make_decision_for_market(
             return None
 
         decision_action = decision.action
-        confidence = decision.confidence
+        confidence = await _calibrate_confidence_from_history(db_manager, decision.confidence)
 
         logger.info(
             f"Generated decision for {market.market_id}: {decision.action} {decision.side} "
-            f"at {decision.limit_price}c with confidence {decision.confidence} (cost: ${total_analysis_cost:.3f})"
+            f"at {decision.limit_price}c with raw_conf={decision.confidence:.4f}, "
+            f"cal_conf={confidence:.4f} (cost: ${total_analysis_cost:.3f})"
         )
 
         # Record the analysis
@@ -290,8 +359,66 @@ async def make_decision_for_market(
             market.market_id, decision_action, confidence, total_analysis_cost
         )
 
-        if decision.action == "BUY" and decision.confidence >= settings.trading.min_confidence_to_trade:
+        if decision.action == "BUY" and confidence >= settings.trading.min_confidence_to_trade:
             price = market.yes_price if decision.side == "YES" else market.no_price
+            # Use calibrated confidence for EV checks so confidence gating and
+            # expected-value gating are aligned.
+            expected_edge = confidence - price
+            haircut = getattr(settings.trading, "ev_fee_slippage_haircut", 0.01)
+            net_expected_edge = expected_edge - haircut
+
+            # Pre-trade EV quality gate: skip trades with insufficient edge even
+            # if confidence clears the absolute threshold.
+            min_expected_edge = getattr(settings.trading, "min_expected_edge", 0.03)
+            category = (market.category or "").lower()
+            multipliers = getattr(settings.trading, "ev_category_multipliers", {}) or {}
+            category_multiplier = multipliers.get(category, multipliers.get("default", 1.0))
+            required_edge = min_expected_edge * category_multiplier
+            time_to_expiry_days = max(
+                getattr(settings.trading, "min_days_for_edge_normalization", 0.5),
+                get_time_to_expiry_days(market),
+            )
+            min_edge_per_day = getattr(settings.trading, "min_expected_edge_per_day", 0.0)
+            net_edge_per_day = net_expected_edge / time_to_expiry_days
+
+            if net_expected_edge < required_edge:
+                logger.info(
+                    f"❌ EV FILTER REJECTED: {market.market_id} "
+                    f"(raw_edge={expected_edge:.4f}, net_edge={net_expected_edge:.4f}, "
+                    f"required={required_edge:.4f}, haircut={haircut:.4f}, "
+                    f"category={market.category}, mult={category_multiplier:.2f})"
+                )
+                await db_manager.record_market_analysis(
+                    market.market_id,
+                    "EV_FILTERED",
+                    confidence,
+                    total_analysis_cost,
+                    (
+                        f"net_edge {net_expected_edge:.4f} below required {required_edge:.4f} "
+                        f"(raw={expected_edge:.4f}, haircut={haircut:.4f}, "
+                        f"category={market.category}, mult={category_multiplier:.2f})"
+                    ),
+                )
+                return None
+
+            if min_edge_per_day > 0 and net_edge_per_day < min_edge_per_day:
+                logger.info(
+                    f"❌ ROI_VELOCITY_FILTER REJECTED: {market.market_id} "
+                    f"(net_edge/day={net_edge_per_day:.6f} < min/day={min_edge_per_day:.6f}, "
+                    f"days={time_to_expiry_days:.2f})"
+                )
+                await db_manager.record_market_analysis(
+                    market.market_id,
+                    "ROI_VELOCITY_FILTERED",
+                    confidence,
+                    total_analysis_cost,
+                    (
+                        f"net_edge_per_day {net_edge_per_day:.6f} below threshold "
+                        f"{min_edge_per_day:.6f} (net_edge={net_expected_edge:.4f}, "
+                        f"days={time_to_expiry_days:.2f}, category={market.category})"
+                    ),
+                )
+                return None
             
             # Apply Grok4 edge filtering - 10% minimum edge requirement
             from src.utils.edge_filter import EdgeFilter
@@ -304,7 +431,7 @@ async def make_decision_for_market(
             should_trade, trade_reason, edge_result = EdgeFilter.should_trade_market(
                 ai_probability=ai_prob,
                 market_probability=market_prob,
-                confidence=decision.confidence,
+                    confidence=confidence,
                 additional_filters={
                     'volume': market.volume,
                     'min_volume': settings.trading.min_volume,
@@ -316,7 +443,7 @@ async def make_decision_for_market(
             if not should_trade:
                 logger.info(f"❌ EDGE FILTER REJECTED: {market.market_id} - {trade_reason}")
                 await db_manager.record_market_analysis(
-                    market.market_id, "EDGE_FILTERED", decision.confidence, total_analysis_cost, trade_reason
+                    market.market_id, "EDGE_FILTERED", confidence, total_analysis_cost, trade_reason
                 )
                 return None
                 
