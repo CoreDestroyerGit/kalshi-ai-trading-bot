@@ -156,6 +156,9 @@ class TradingConfig:
     max_ai_cost_per_decision: float = 0.08  # INCREASED: Higher per-decision cost (was 0.05, now 0.08)
     analysis_cooldown_hours: int = 1  # More responsive re-analysis cadence
     max_analyses_per_market_per_day: int = 12  # Allow more opportunities through
+    # Directional opportunity generation controls (portfolio optimization path)
+    max_markets_for_ai_analysis: int = 30  # Analyze deeper book than only top 10
+    min_edge_percentage_filter: float = 0.05  # 5% minimum edge filter (was effectively 10%)
     
     # Daily AI spending limits - SAFETY CONTROLS
     # Default is $10/day — conservative limit to prevent runaway API spend.

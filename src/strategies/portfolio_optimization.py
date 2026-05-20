@@ -829,7 +829,7 @@ async def create_market_opportunities_from_markets(
     opportunities = []
     
     # Limit markets to prevent excessive AI costs and focus on best opportunities
-    max_markets_to_analyze = 10  # REDUCED: More selective (was 20, now 10) to focus on highest quality
+    max_markets_to_analyze = int(getattr(settings.trading, "max_markets_for_ai_analysis", 30))
     if len(markets) > max_markets_to_analyze:
         # Sort by volume and take top markets
         markets = sorted(markets, key=lambda m: m.volume, reverse=True)[:max_markets_to_analyze]
@@ -877,7 +877,8 @@ async def create_market_opportunities_from_markets(
             from src.utils.edge_filter import EdgeFilter
             edge_result = EdgeFilter.calculate_edge(predicted_prob, market_prob, confidence)
             
-            if edge_result.passes_filter:  # Must pass 10% edge filter
+            min_edge_pct = float(getattr(settings.trading, "min_edge_percentage_filter", 0.05))
+            if edge_result.edge_percentage >= min_edge_pct:
                 opportunity = MarketOpportunity(
                     market_id=market.market_id,
                     market_title=market.title,
@@ -904,13 +905,22 @@ async def create_market_opportunities_from_markets(
                 opportunity.recommended_side = edge_result.side
                 
                 opportunities.append(opportunity)
-                logger.info(f"✅ EDGE APPROVED: {market.market_id} - Edge: {edge_result.edge_percentage:.1%} ({edge_result.side}), Confidence: {confidence:.1%}, Reason: {edge_result.reason}")
+                logger.info(
+                    f"✅ EDGE APPROVED: {market.market_id} - "
+                    f"Edge: {edge_result.edge_percentage:.1%} ({edge_result.side}), "
+                    f"Confidence: {confidence:.1%}, MinEdge: {min_edge_pct:.1%}, "
+                    f"Reason: {edge_result.reason}"
+                )
                 
                 # 🚀 IMMEDIATE TRADING: Place trade for strong opportunities
                 if db_manager:
                     await _evaluate_immediate_trade(opportunity, db_manager, kalshi_client, total_capital)
             else:
-                logger.info(f"❌ EDGE FILTERED: {market.market_id} - {edge_result.reason}")
+                logger.info(
+                    f"❌ EDGE FILTERED: {market.market_id} - "
+                    f"edge={edge_result.edge_percentage:.1%} < min={min_edge_pct:.1%}; "
+                    f"{edge_result.reason}"
+                )
             
         except Exception as e:
             logger.error(f"Error creating opportunity from {market.market_id}: {e}")
