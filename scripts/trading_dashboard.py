@@ -103,17 +103,40 @@ def load_performance_data():
                 try:
                     positions_response = await kalshi_client.get_positions()
                     kalshi_positions = positions_response.get('market_positions', [])
+                    if not kalshi_positions:
+                        kalshi_positions = positions_response.get('event_positions', [])
                 except Exception as exc:
                     st.warning(f"Kalshi live positions unavailable: {exc}")
                     kalshi_positions = []
 
+                if not kalshi_positions:
+                    db_positions = await db_manager.get_open_positions()
+                    positions = [
+                        {
+                            'market_id': str(p.market_id),
+                            'side': p.side,
+                            'quantity': int(p.quantity),
+                            'entry_price': float(p.entry_price),
+                            'timestamp': p.timestamp.isoformat() if hasattr(p.timestamp, "isoformat") else str(p.timestamp),
+                            'strategy': p.strategy or 'db_fallback',
+                            'status': p.status,
+                            'stop_loss_price': p.stop_loss_price,
+                            'take_profit_price': p.take_profit_price,
+                        }
+                        for p in db_positions
+                    ]
+                    return performance, positions
+
                 # Convert Kalshi positions to simple dictionaries for caching
                 for pos in kalshi_positions:
-                    if pos.get('position', 0) == 0:
+                    if 'position' in pos:
+                        ticker = pos.get('ticker')
+                        position_count = pos.get('position', 0)
+                    else:
+                        ticker = pos.get('event_ticker')
+                        position_count = float(pos.get('event_exposure_dollars', 0))
+                    if not ticker or position_count == 0:
                         continue
-
-                    ticker = pos.get('ticker')
-                    position_count = pos.get('position', 0)
                     position_dict = {
                         'market_id': str(ticker),
                         'side': 'YES' if position_count > 0 else 'NO',
@@ -228,6 +251,8 @@ def load_system_health():
             try:
                 positions_response = await kalshi_client.get_positions()
                 market_positions = positions_response.get('market_positions', [])
+                if not market_positions:
+                    market_positions = positions_response.get('event_positions', [])
                 live_source = True
             except Exception as exc:
                 st.warning(f"Live positions unavailable, using local DB positions: {exc}")
@@ -244,8 +269,11 @@ def load_system_health():
             # Calculate current value of all positions
             for position in market_positions:
                 try:
-                    ticker = position.get('ticker')
+                    ticker = position.get('ticker') or position.get('event_ticker')
                     position_count = position.get('position', 0)
+                    if position_count == 0 and 'event_exposure_dollars' in position:
+                        # event_positions schema fallback; use exposure as proxy count
+                        position_count = float(position.get('event_exposure_dollars', 0))
                     
                     if ticker and position_count != 0:
                         if not live_source:
