@@ -133,6 +133,23 @@ class TradingConfig:
     # AI trading criteria - MORE PERMISSIVE
     max_analysis_cost_per_decision: float = 0.15  # INCREASED: Allow higher cost per decision (was 0.10, now 0.15)
     min_confidence_threshold: float = 0.45  # DECREASED: Lower confidence threshold (was 0.55, now 0.45)
+    # Require a minimum expected edge (AI probability - market price) before trading.
+    # This helps avoid low-quality "coin-flip" entries that pass confidence threshold
+    # but have weak expected value after fees/slippage.
+    min_expected_edge: float = 0.03  # 3 cents of edge per contract
+    # Conservative execution haircut for fees/slippage when evaluating EV.
+    ev_fee_slippage_haircut: float = 0.01  # 1 cent
+    # Category multipliers for EV thresholding (higher = stricter).
+    ev_category_multipliers: Dict[str, float] = field(default_factory=lambda: {
+        "sports": 0.90,
+        "economics": 1.20,
+        "politics": 1.05,
+        "default": 1.0,
+    })
+    # Time-normalized EV thresholding (ROI velocity): require minimum
+    # net expected edge per day to avoid tying up capital in slow-return bets.
+    min_expected_edge_per_day: float = 0.0025  # 0.25 cents/day
+    min_days_for_edge_normalization: float = 0.5  # Prevent near-zero division
 
     # Cost control and market analysis frequency - MORE PERMISSIVE
     daily_ai_budget: float = 10.0  # INCREASED: Higher daily budget (was 5.0, now 10.0)

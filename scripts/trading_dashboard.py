@@ -84,60 +84,69 @@ def load_performance_data():
         
         async def get_data():
             await db_manager.initialize()
-            
-            # Get performance by strategy - ensure it's serializable
-            performance_raw = await db_manager.get_performance_by_strategy()
-            
-            # Convert performance data to ensure serializability
-            performance = {}
-            if performance_raw:
-                for strategy, stats in performance_raw.items():
-                    performance[str(strategy)] = {
-                        str(k): float(v) if isinstance(v, (int, float)) else str(v) 
-                        for k, v in stats.items()
-                    }
-            
-            # Get LIVE positions from Kalshi API (not just database)
-            positions_response = await kalshi_client.get_positions()
-            kalshi_positions = positions_response.get('market_positions', [])
-            
-            # Convert Kalshi positions to simple dictionaries for caching
-            positions = []
-            for pos in kalshi_positions:
-                if pos.get('position', 0) != 0:  # Only active positions
+            try:
+                # Get performance by strategy - ensure it's serializable
+                performance_raw = await db_manager.get_performance_by_strategy()
+
+                # Convert performance data to ensure serializability
+                performance = {}
+                if performance_raw:
+                    for strategy, stats in performance_raw.items():
+                        performance[str(strategy)] = {
+                            str(k): float(v) if isinstance(v, (int, float)) else str(v)
+                            for k, v in stats.items()
+                        }
+
+                # Get LIVE positions from Kalshi API (not just database).
+                # If API credentials are missing or unreachable, gracefully fall back.
+                positions = []
+                try:
+                    positions_response = await kalshi_client.get_positions()
+                    kalshi_positions = positions_response.get('market_positions', [])
+                except Exception as exc:
+                    st.warning(f"Kalshi live positions unavailable: {exc}")
+                    kalshi_positions = []
+
+                # Convert Kalshi positions to simple dictionaries for caching
+                for pos in kalshi_positions:
+                    if pos.get('position', 0) == 0:
+                        continue
+
                     ticker = pos.get('ticker')
                     position_count = pos.get('position', 0)
-                    
-                    # Create a simple dictionary with only serializable types
                     position_dict = {
                         'market_id': str(ticker),
                         'side': 'YES' if position_count > 0 else 'NO',
                         'quantity': int(abs(position_count)),
-                        'entry_price': 0.50,  # Will be updated below
+                        'entry_price': 0.50,
                         'timestamp': datetime.now().isoformat(),
                         'strategy': 'live_sync',
                         'status': 'open',
                         'stop_loss_price': None,
-                        'take_profit_price': None
+                        'take_profit_price': None,
                     }
-                    
-                    # Try to get current market price for better accuracy
+
                     try:
                         market_data = await kalshi_client.get_market(ticker)
                         if market_data and 'market' in market_data:
                             market_info = market_data['market']
-                            if position_count > 0:  # YES position
-                                position_dict['entry_price'] = float((market_info.get('yes_bid', 0) + market_info.get('yes_ask', 100)) / 2 / 100)
-                            else:  # NO position
-                                position_dict['entry_price'] = float((market_info.get('no_bid', 0) + market_info.get('no_ask', 100)) / 2 / 100)
-                    except:
-                        position_dict['entry_price'] = 0.50  # Keep default price as float
-                    
+                            if position_count > 0:
+                                position_dict['entry_price'] = float(
+                                    (market_info.get('yes_bid', 0) + market_info.get('yes_ask', 100)) / 2 / 100
+                                )
+                            else:
+                                position_dict['entry_price'] = float(
+                                    (market_info.get('no_bid', 0) + market_info.get('no_ask', 100)) / 2 / 100
+                                )
+                    except Exception:
+                        position_dict['entry_price'] = 0.50
+
                     positions.append(position_dict)
-            
-            await db_manager.close()
-            
-            return performance, positions
+
+                return performance, positions
+            finally:
+                await kalshi_client.close()
+                await db_manager.close()
         
         performance, positions = loop.run_until_complete(get_data())
         loop.close()
