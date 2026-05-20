@@ -169,6 +169,25 @@ def load_performance_data():
 
                     positions.append(position_dict)
 
+                # Safety fallback: if live payload existed but parsing yielded zero
+                # positions, use DB open positions to avoid false-empty dashboard.
+                if not positions:
+                    db_positions = await db_manager.get_open_positions()
+                    positions = [
+                        {
+                            'market_id': str(p.market_id),
+                            'side': p.side,
+                            'quantity': int(p.quantity),
+                            'entry_price': float(p.entry_price),
+                            'timestamp': p.timestamp.isoformat() if hasattr(p.timestamp, "isoformat") else str(p.timestamp),
+                            'strategy': p.strategy or 'db_fallback',
+                            'status': p.status,
+                            'stop_loss_price': p.stop_loss_price,
+                            'take_profit_price': p.take_profit_price,
+                        }
+                        for p in db_positions
+                    ]
+
                 return performance, positions
             finally:
                 await kalshi_client.close()
