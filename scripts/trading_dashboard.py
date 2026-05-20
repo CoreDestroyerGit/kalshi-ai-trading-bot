@@ -130,17 +130,20 @@ def load_performance_data():
                 # Convert Kalshi positions to simple dictionaries for caching
                 for pos in kalshi_positions:
                     if 'position' in pos:
-                        ticker = pos.get('ticker')
-                        position_count = pos.get('position', 0)
+                        ticker = pos.get('ticker') or pos.get('market_ticker')
+                        position_count = float(pos.get('position', 0) or 0)
+                        quantity = int(abs(position_count))
                     else:
-                        ticker = pos.get('event_ticker')
-                        position_count = float(pos.get('event_exposure_dollars', 0))
+                        ticker = pos.get('event_ticker') or pos.get('ticker') or pos.get('market_ticker')
+                        position_count = float(pos.get('event_exposure_dollars', 0) or 0)
+                        # event_positions often expose dollar exposure instead of contract count
+                        quantity = max(1, int(round(abs(position_count)))) if position_count != 0 else 0
                     if not ticker or position_count == 0:
                         continue
                     position_dict = {
                         'market_id': str(ticker),
                         'side': 'YES' if position_count > 0 else 'NO',
-                        'quantity': int(abs(position_count)),
+                        'quantity': quantity,
                         'entry_price': 0.50,
                         'timestamp': datetime.now().isoformat(),
                         'strategy': 'live_sync',
@@ -264,12 +267,15 @@ def load_system_health():
                 live_source = False
 
             total_position_value = 0.0
-            positions_count = len([p for p in market_positions if p.get('position', 0) != 0])
+            positions_count = len([
+                p for p in market_positions
+                if (p.get('position', 0) != 0) or (float(p.get('event_exposure_dollars', 0) or 0) != 0)
+            ])
             
             # Calculate current value of all positions
             for position in market_positions:
                 try:
-                    ticker = position.get('ticker') or position.get('event_ticker')
+                    ticker = position.get('ticker') or position.get('event_ticker') or position.get('market_ticker')
                     position_count = position.get('position', 0)
                     if position_count == 0 and 'event_exposure_dollars' in position:
                         # event_positions schema fallback; use exposure as proxy count
@@ -278,6 +284,10 @@ def load_system_health():
                     if ticker and position_count != 0:
                         if not live_source:
                             total_position_value += abs(position_count) * float(position.get("entry_price", 0.0))
+                            continue
+                        # event_positions already include exposure dollars; use it directly.
+                        if 'event_exposure_dollars' in position and position.get('position', 0) == 0:
+                            total_position_value += abs(float(position.get('event_exposure_dollars', 0) or 0))
                             continue
                         # Get current market data
                         market_data = await kalshi_client.get_market(ticker)
