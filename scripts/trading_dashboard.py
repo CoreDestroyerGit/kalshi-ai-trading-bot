@@ -211,18 +211,35 @@ def load_system_health():
         asyncio.set_event_loop(loop)
         
         kalshi_client = KalshiClient()
+        db_manager = DatabaseManager()
         
         async def get_health():
-            # Get available cash
-            balance_response = await kalshi_client.get_balance()
-            available_cash = balance_response.get('balance', 0) / 100
-            
-            # Get current positions to calculate total portfolio value
-            positions_response = await kalshi_client.get_positions()
-            market_positions = positions_response.get('market_positions', [])
-            
-            total_position_value = 0
-            positions_count = len(market_positions)
+            await db_manager.initialize()
+
+            # Get available cash (prefer live Kalshi; fallback to 0 on failure).
+            try:
+                balance_response = await kalshi_client.get_balance()
+                available_cash = balance_response.get('balance', 0) / 100
+            except Exception as exc:
+                st.warning(f"Live balance unavailable, using fallback values: {exc}")
+                available_cash = 0.0
+
+            # Get current positions (prefer live Kalshi; fallback to DB open positions).
+            try:
+                positions_response = await kalshi_client.get_positions()
+                market_positions = positions_response.get('market_positions', [])
+                live_source = True
+            except Exception as exc:
+                st.warning(f"Live positions unavailable, using local DB positions: {exc}")
+                db_positions = await db_manager.get_open_positions()
+                market_positions = [
+                    {"ticker": p.market_id, "position": p.quantity if p.side == "YES" else -p.quantity, "entry_price": p.entry_price}
+                    for p in db_positions
+                ]
+                live_source = False
+
+            total_position_value = 0.0
+            positions_count = len([p for p in market_positions if p.get('position', 0) != 0])
             
             # Calculate current value of all positions
             for position in market_positions:
@@ -231,6 +248,9 @@ def load_system_health():
                     position_count = position.get('position', 0)
                     
                     if ticker and position_count != 0:
+                        if not live_source:
+                            total_position_value += abs(position_count) * float(position.get("entry_price", 0.0))
+                            continue
                         # Get current market data
                         market_data = await kalshi_client.get_market(ticker)
                         if market_data and 'market' in market_data:
@@ -251,13 +271,15 @@ def load_system_health():
                     print(f"Warning: Could not value position {ticker}: {e}")
                     continue
             
-            # Total portfolio value = cash + position values
             total_portfolio_value = available_cash + total_position_value
-            
             return available_cash, total_portfolio_value, positions_count, total_position_value
-        
-        available_cash, total_portfolio_value, positions_count, position_value = loop.run_until_complete(get_health())
-        loop.close()
+            
+        try:
+            available_cash, total_portfolio_value, positions_count, position_value = loop.run_until_complete(get_health())
+        finally:
+            loop.run_until_complete(kalshi_client.close())
+            loop.run_until_complete(db_manager.close())
+            loop.close()
         
         return {
             'available_cash': available_cash,
