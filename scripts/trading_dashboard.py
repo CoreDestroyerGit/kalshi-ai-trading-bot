@@ -288,9 +288,16 @@ def load_system_health():
             # Get current positions (prefer live Kalshi; fallback to DB open positions).
             try:
                 positions_response = await kalshi_client.get_positions()
-                market_positions = positions_response.get('market_positions', [])
-                if not market_positions:
-                    market_positions = positions_response.get('event_positions', [])
+                payload = positions_response if isinstance(positions_response, dict) else {}
+                nested = payload.get("positions", {}) if isinstance(payload.get("positions"), dict) else {}
+                market_positions = (
+                    payload.get("market_positions")
+                    or nested.get("market_positions")
+                    or payload.get("event_positions")
+                    or nested.get("event_positions")
+                    or (payload.get("positions") if isinstance(payload.get("positions"), list) else [])
+                    or []
+                )
                 live_source = True
             except Exception as exc:
                 st.warning(f"Live positions unavailable, using local DB positions: {exc}")
@@ -303,10 +310,15 @@ def load_system_health():
 
             # Prefer direct Kalshi portfolio_value when present.
             total_position_value = (portfolio_value_cents / 100.0) if portfolio_value_cents else 0.0
-            positions_count = len([
-                p for p in market_positions
-                if (p.get('position', 0) != 0) or (float(p.get('event_exposure_dollars', 0) or 0) != 0)
-            ])
+            positions_count = 0
+            for p in market_positions:
+                raw_position = p.get('position', 0) or p.get('market_position', 0) or 0
+                raw_exposure = p.get('event_exposure_dollars', 0) or p.get('exposure_dollars', 0) or 0
+                try:
+                    if float(raw_position) != 0 or float(raw_exposure) != 0:
+                        positions_count += 1
+                except (TypeError, ValueError):
+                    continue
             
             # Calculate current value of all positions
             for position in market_positions:
