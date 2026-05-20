@@ -102,9 +102,20 @@ def load_performance_data():
                 positions = []
                 try:
                     positions_response = await kalshi_client.get_positions()
-                    kalshi_positions = positions_response.get('market_positions', [])
-                    if not kalshi_positions:
-                        kalshi_positions = positions_response.get('event_positions', [])
+                    # Kalshi payloads can vary by wrapper/version:
+                    # 1) {"market_positions": [...], "event_positions": [...]}
+                    # 2) {"positions": {"market_positions": [...], "event_positions": [...]}}
+                    # 3) {"positions": [...]} (legacy-like generic list)
+                    payload = positions_response if isinstance(positions_response, dict) else {}
+                    nested = payload.get("positions", {}) if isinstance(payload.get("positions"), dict) else {}
+                    kalshi_positions = (
+                        payload.get("market_positions")
+                        or nested.get("market_positions")
+                        or payload.get("event_positions")
+                        or nested.get("event_positions")
+                        or (payload.get("positions") if isinstance(payload.get("positions"), list) else [])
+                        or []
+                    )
                 except Exception as exc:
                     st.warning(f"Kalshi live positions unavailable: {exc}")
                     kalshi_positions = []
@@ -150,6 +161,7 @@ def load_performance_data():
                         'status': 'open',
                         'stop_loss_price': None,
                         'take_profit_price': None,
+                        'realized_pnl': float(pos.get('realized_pnl_dollars', 0) or 0),
                     }
 
                     try:
@@ -455,6 +467,9 @@ def show_overview(performance_data, positions, system_health_data):
     
     with col2:
         total_trades = sum(stats.get('completed_trades', 0) for stats in performance_data.values()) if performance_data else 0
+        if total_trades == 0 and positions:
+            # Fallback signal that we still have meaningful live portfolio activity
+            total_trades = len(positions)
         st.metric(
             label="📈 Total Trades",
             value=total_trades,
@@ -464,6 +479,9 @@ def show_overview(performance_data, positions, system_health_data):
     with col3:
         # Calculate both realized and unrealized P&L
         realized_pnl = sum(stats.get('total_pnl', 0) for stats in performance_data.values()) if performance_data else 0
+        if realized_pnl == 0 and positions:
+            # Use live realized pnl exposure (event_positions) when trade_logs are empty.
+            realized_pnl = sum(float(pos.get('realized_pnl', 0) or 0) for pos in positions)
         
         # Calculate unrealized P&L from current positions
         unrealized_pnl = 0
@@ -488,9 +506,10 @@ def show_overview(performance_data, positions, system_health_data):
         )
     
     with col4:
+        active_positions_count = len(positions) if positions else int(system_health_data.get('positions_count', 0) or 0)
         st.metric(
             label="🎯 Active Positions",
-            value=len(positions) if positions else 0,
+            value=active_positions_count,
             help="Currently open positions"
         )
     
