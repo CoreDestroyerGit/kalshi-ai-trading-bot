@@ -627,6 +627,12 @@ class AdvancedPortfolioOptimizer:
         try:
             constrained_allocation = {}
             total_allocation = 0.0
+            # Prevent "all allocations removed" when portfolio capital is small.
+            # Keep configured floor for larger books, but scale down for small balances.
+            effective_min_position_size = min(
+                float(self.min_position_size),
+                max(0.5, float(self.total_capital) * 0.02)
+            )
             
             for market_id, fraction in allocation.items():
                 # Find the opportunity
@@ -636,7 +642,7 @@ class AdvancedPortfolioOptimizer:
                 
                 # Apply minimum position size
                 dollar_allocation = fraction * self.total_capital
-                if dollar_allocation < self.min_position_size:
+                if dollar_allocation < effective_min_position_size:
                     continue
                 
                 # Apply maximum position fraction
@@ -655,6 +661,10 @@ class AdvancedPortfolioOptimizer:
                     break
             
             self.logger.info(f"Risk constraints applied. Total allocation: {total_allocation:.3f}")
+            self.logger.info(
+                f"Risk constraint thresholds: min_position_size=${effective_min_position_size:.2f}, "
+                f"max_position_fraction={self.max_position_fraction:.3f}, total_capital=${self.total_capital:.2f}"
+            )
             self.logger.info(f"Final constrained allocations: {constrained_allocation}")
             
             return constrained_allocation
@@ -829,7 +839,7 @@ async def create_market_opportunities_from_markets(
     opportunities = []
     
     # Limit markets to prevent excessive AI costs and focus on best opportunities
-    max_markets_to_analyze = 10  # REDUCED: More selective (was 20, now 10) to focus on highest quality
+    max_markets_to_analyze = int(getattr(settings.trading, "max_markets_for_ai_analysis", 30))
     if len(markets) > max_markets_to_analyze:
         # Sort by volume and take top markets
         markets = sorted(markets, key=lambda m: m.volume, reverse=True)[:max_markets_to_analyze]
@@ -877,7 +887,8 @@ async def create_market_opportunities_from_markets(
             from src.utils.edge_filter import EdgeFilter
             edge_result = EdgeFilter.calculate_edge(predicted_prob, market_prob, confidence)
             
-            if edge_result.passes_filter:  # Must pass 10% edge filter
+            min_edge_pct = float(getattr(settings.trading, "min_edge_percentage_filter", 0.05))
+            if edge_result.passes_filter and edge_result.edge_percentage >= min_edge_pct:
                 opportunity = MarketOpportunity(
                     market_id=market.market_id,
                     market_title=market.title,
@@ -904,13 +915,23 @@ async def create_market_opportunities_from_markets(
                 opportunity.recommended_side = edge_result.side
                 
                 opportunities.append(opportunity)
-                logger.info(f"✅ EDGE APPROVED: {market.market_id} - Edge: {edge_result.edge_percentage:.1%} ({edge_result.side}), Confidence: {confidence:.1%}, Reason: {edge_result.reason}")
+                logger.info(
+                    f"✅ EDGE APPROVED: {market.market_id} - "
+                    f"Edge: {edge_result.edge_percentage:.1%} ({edge_result.side}), "
+                    f"Confidence: {confidence:.1%}, MinEdge: {min_edge_pct:.1%}, "
+                    f"Reason: {edge_result.reason}"
+                )
                 
                 # 🚀 IMMEDIATE TRADING: Place trade for strong opportunities
                 if db_manager:
                     await _evaluate_immediate_trade(opportunity, db_manager, kalshi_client, total_capital)
             else:
-                logger.info(f"❌ EDGE FILTERED: {market.market_id} - {edge_result.reason}")
+                logger.info(
+                    f"❌ EDGE FILTERED: {market.market_id} - "
+                    f"passes_filter={edge_result.passes_filter}, "
+                    f"edge={edge_result.edge_percentage:.1%}, min={min_edge_pct:.1%}; "
+                    f"{edge_result.reason}"
+                )
             
         except Exception as e:
             logger.error(f"Error creating opportunity from {market.market_id}: {e}")
@@ -944,7 +965,7 @@ async def _evaluate_immediate_trade(
                 'volume': getattr(opportunity, 'volume', 1000),
                 'min_volume': 1000,
                 'time_to_expiry_days': opportunity.time_to_expiry,
-                'max_time_to_expiry': 365
+                'max_time_to_expiry': settings.trading.max_time_to_expiry_days
             }
         )
         

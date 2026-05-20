@@ -16,6 +16,7 @@ from src.utils.database import DatabaseManager, Position, TradeLog
 from src.config.settings import settings
 from src.utils.logging_setup import setup_logging, get_trading_logger
 from src.clients.kalshi_client import KalshiClient
+from src.utils.market_prices import get_market_prices
 
 async def should_exit_position(
     position: Position, 
@@ -186,9 +187,15 @@ async def run_tracking(db_manager: Optional[DatabaseManager] = None):
                     logger.warning(f"Could not retrieve market data for {position.market_id}. Skipping.")
                     continue
 
-                # Get current prices
-                current_yes_price = market_data.get('yes_price', 0) / 100  # Convert cents to dollars
-                current_no_price = market_data.get('no_price', 0) / 100
+                # Get normalized current prices (supports API v2 + legacy schemas).
+                _yes_bid, yes_ask, _no_bid, no_ask = get_market_prices(market_data)
+                # Some call paths (including tests) provide yes_price/no_price.
+                if yes_ask <= 0:
+                    yes_ask = float(market_data.get("yes_price", 0)) / 100.0
+                if no_ask <= 0:
+                    no_ask = float(market_data.get("no_price", 0)) / 100.0
+                current_yes_price = yes_ask
+                current_no_price = no_ask
                 market_status = market_data.get('status', 'unknown')
                 market_result = market_data.get('result')  # Market resolution result
                 
