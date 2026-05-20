@@ -133,12 +133,32 @@ class TradingConfig:
     # AI trading criteria - MORE PERMISSIVE
     max_analysis_cost_per_decision: float = 0.15  # INCREASED: Allow higher cost per decision (was 0.10, now 0.15)
     min_confidence_threshold: float = 0.45  # DECREASED: Lower confidence threshold (was 0.55, now 0.45)
+    # Require a minimum expected edge (AI probability - market price) before trading.
+    # This helps avoid low-quality "coin-flip" entries that pass confidence threshold
+    # but have weak expected value after fees/slippage.
+    min_expected_edge: float = 0.015  # 1.5 cents of edge per contract
+    # Conservative execution haircut for fees/slippage when evaluating EV.
+    ev_fee_slippage_haircut: float = 0.01  # 1 cent
+    # Category multipliers for EV thresholding (higher = stricter).
+    ev_category_multipliers: Dict[str, float] = field(default_factory=lambda: {
+        "sports": 0.90,
+        "economics": 1.20,
+        "politics": 1.05,
+        "default": 1.0,
+    })
+    # Time-normalized EV thresholding (ROI velocity): require minimum
+    # net expected edge per day to avoid tying up capital in slow-return bets.
+    min_expected_edge_per_day: float = 0.001  # 0.10 cents/day
+    min_days_for_edge_normalization: float = 0.5  # Prevent near-zero division
 
     # Cost control and market analysis frequency - MORE PERMISSIVE
     daily_ai_budget: float = 10.0  # INCREASED: Higher daily budget (was 5.0, now 10.0)
     max_ai_cost_per_decision: float = 0.08  # INCREASED: Higher per-decision cost (was 0.05, now 0.08)
-    analysis_cooldown_hours: int = 3  # DECREASED: Shorter cooldown (was 6, now 3)
-    max_analyses_per_market_per_day: int = 4  # INCREASED: More analyses per day (was 2, now 4)
+    analysis_cooldown_hours: int = 1  # More responsive re-analysis cadence
+    max_analyses_per_market_per_day: int = 12  # Allow more opportunities through
+    # Directional opportunity generation controls (portfolio optimization path)
+    max_markets_for_ai_analysis: int = 30  # Analyze deeper book than only top 10
+    min_edge_percentage_filter: float = 0.05  # 5% minimum edge filter (was effectively 10%)
     
     # Daily AI spending limits - SAFETY CONTROLS
     # Default is $10/day — conservative limit to prevent runaway API spend.

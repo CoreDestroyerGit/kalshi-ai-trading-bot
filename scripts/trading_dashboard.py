@@ -84,60 +84,126 @@ def load_performance_data():
         
         async def get_data():
             await db_manager.initialize()
-            
-            # Get performance by strategy - ensure it's serializable
-            performance_raw = await db_manager.get_performance_by_strategy()
-            
-            # Convert performance data to ensure serializability
-            performance = {}
-            if performance_raw:
-                for strategy, stats in performance_raw.items():
-                    performance[str(strategy)] = {
-                        str(k): float(v) if isinstance(v, (int, float)) else str(v) 
-                        for k, v in stats.items()
-                    }
-            
-            # Get LIVE positions from Kalshi API (not just database)
-            positions_response = await kalshi_client.get_positions()
-            kalshi_positions = positions_response.get('market_positions', [])
-            
-            # Convert Kalshi positions to simple dictionaries for caching
-            positions = []
-            for pos in kalshi_positions:
-                if pos.get('position', 0) != 0:  # Only active positions
-                    ticker = pos.get('ticker')
-                    position_count = pos.get('position', 0)
-                    
-                    # Create a simple dictionary with only serializable types
+            try:
+                # Get performance by strategy - ensure it's serializable
+                performance_raw = await db_manager.get_performance_by_strategy()
+
+                # Convert performance data to ensure serializability
+                performance = {}
+                if performance_raw:
+                    for strategy, stats in performance_raw.items():
+                        performance[str(strategy)] = {
+                            str(k): float(v) if isinstance(v, (int, float)) else str(v)
+                            for k, v in stats.items()
+                        }
+
+                # Get LIVE positions from Kalshi API (not just database).
+                # If API credentials are missing or unreachable, gracefully fall back.
+                positions = []
+                try:
+                    positions_response = await kalshi_client.get_positions()
+                    # Kalshi payloads can vary by wrapper/version:
+                    # 1) {"market_positions": [...], "event_positions": [...]}
+                    # 2) {"positions": {"market_positions": [...], "event_positions": [...]}}
+                    # 3) {"positions": [...]} (legacy-like generic list)
+                    payload = positions_response if isinstance(positions_response, dict) else {}
+                    nested = payload.get("positions", {}) if isinstance(payload.get("positions"), dict) else {}
+                    kalshi_positions = (
+                        payload.get("market_positions")
+                        or nested.get("market_positions")
+                        or payload.get("event_positions")
+                        or nested.get("event_positions")
+                        or (payload.get("positions") if isinstance(payload.get("positions"), list) else [])
+                        or []
+                    )
+                except Exception as exc:
+                    st.warning(f"Kalshi live positions unavailable: {exc}")
+                    kalshi_positions = []
+
+                if not kalshi_positions:
+                    db_positions = await db_manager.get_open_positions()
+                    positions = [
+                        {
+                            'market_id': str(p.market_id),
+                            'side': p.side,
+                            'quantity': int(p.quantity),
+                            'entry_price': float(p.entry_price),
+                            'timestamp': p.timestamp.isoformat() if hasattr(p.timestamp, "isoformat") else str(p.timestamp),
+                            'strategy': p.strategy or 'db_fallback',
+                            'status': p.status,
+                            'stop_loss_price': p.stop_loss_price,
+                            'take_profit_price': p.take_profit_price,
+                        }
+                        for p in db_positions
+                    ]
+                    return performance, positions
+
+                # Convert Kalshi positions to simple dictionaries for caching
+                for pos in kalshi_positions:
+                    if 'position' in pos:
+                        ticker = pos.get('ticker') or pos.get('market_ticker')
+                        position_count = float(pos.get('position', 0) or 0)
+                        quantity = int(abs(position_count))
+                    else:
+                        ticker = pos.get('event_ticker') or pos.get('ticker') or pos.get('market_ticker')
+                        position_count = float(pos.get('event_exposure_dollars', 0) or 0)
+                        # event_positions often expose dollar exposure instead of contract count
+                        quantity = max(1, int(round(abs(position_count)))) if position_count != 0 else 0
+                    if not ticker or position_count == 0:
+                        continue
                     position_dict = {
                         'market_id': str(ticker),
                         'side': 'YES' if position_count > 0 else 'NO',
-                        'quantity': int(abs(position_count)),
-                        'entry_price': 0.50,  # Will be updated below
+                        'quantity': quantity,
+                        'entry_price': 0.50,
                         'timestamp': datetime.now().isoformat(),
                         'strategy': 'live_sync',
                         'status': 'open',
                         'stop_loss_price': None,
-                        'take_profit_price': None
+                        'take_profit_price': None,
+                        'realized_pnl': float(pos.get('realized_pnl_dollars', 0) or 0),
                     }
-                    
-                    # Try to get current market price for better accuracy
+
                     try:
                         market_data = await kalshi_client.get_market(ticker)
                         if market_data and 'market' in market_data:
                             market_info = market_data['market']
-                            if position_count > 0:  # YES position
-                                position_dict['entry_price'] = float((market_info.get('yes_bid', 0) + market_info.get('yes_ask', 100)) / 2 / 100)
-                            else:  # NO position
-                                position_dict['entry_price'] = float((market_info.get('no_bid', 0) + market_info.get('no_ask', 100)) / 2 / 100)
-                    except:
-                        position_dict['entry_price'] = 0.50  # Keep default price as float
-                    
+                            if position_count > 0:
+                                position_dict['entry_price'] = float(
+                                    (market_info.get('yes_bid', 0) + market_info.get('yes_ask', 100)) / 2 / 100
+                                )
+                            else:
+                                position_dict['entry_price'] = float(
+                                    (market_info.get('no_bid', 0) + market_info.get('no_ask', 100)) / 2 / 100
+                                )
+                    except Exception:
+                        position_dict['entry_price'] = 0.50
+
                     positions.append(position_dict)
-            
-            await db_manager.close()
-            
-            return performance, positions
+
+                # Safety fallback: if live payload existed but parsing yielded zero
+                # positions, use DB open positions to avoid false-empty dashboard.
+                if not positions:
+                    db_positions = await db_manager.get_open_positions()
+                    positions = [
+                        {
+                            'market_id': str(p.market_id),
+                            'side': p.side,
+                            'quantity': int(p.quantity),
+                            'entry_price': float(p.entry_price),
+                            'timestamp': p.timestamp.isoformat() if hasattr(p.timestamp, "isoformat") else str(p.timestamp),
+                            'strategy': p.strategy or 'db_fallback',
+                            'status': p.status,
+                            'stop_loss_price': p.stop_loss_price,
+                            'take_profit_price': p.take_profit_price,
+                        }
+                        for p in db_positions
+                    ]
+
+                return performance, positions
+            finally:
+                await kalshi_client.close()
+                await db_manager.close()
         
         performance, positions = loop.run_until_complete(get_data())
         loop.close()
@@ -194,7 +260,8 @@ def load_llm_data():
         st.error(f"Error loading LLM data: {e}")
         return [], {}
 
-@st.cache_data(ttl=300)  # Cache for 5 minutes
+# Keep this near-real-time; stale cache was masking live position changes.
+@st.cache_data(ttl=30)
 def load_system_health():
     """Load system health metrics including both available cash and total portfolio value."""
     try:
@@ -202,26 +269,77 @@ def load_system_health():
         asyncio.set_event_loop(loop)
         
         kalshi_client = KalshiClient()
+        db_manager = DatabaseManager()
         
         async def get_health():
-            # Get available cash
-            balance_response = await kalshi_client.get_balance()
-            available_cash = balance_response.get('balance', 0) / 100
-            
-            # Get current positions to calculate total portfolio value
-            positions_response = await kalshi_client.get_positions()
-            market_positions = positions_response.get('market_positions', [])
-            
-            total_position_value = 0
-            positions_count = len(market_positions)
+            await db_manager.initialize()
+
+            # Get available cash (prefer live Kalshi; fallback to 0 on failure).
+            try:
+                balance_response = await kalshi_client.get_balance()
+                available_cash = balance_response.get('balance', 0) / 100
+                # Kalshi v2 often includes portfolio value directly (in cents).
+                portfolio_value_cents = balance_response.get('portfolio_value', 0)
+            except Exception as exc:
+                st.warning(f"Live balance unavailable, using fallback values: {exc}")
+                available_cash = 0.0
+                portfolio_value_cents = 0
+
+            # Get current positions (prefer live Kalshi; fallback to DB open positions).
+            try:
+                positions_response = await kalshi_client.get_positions()
+                payload = positions_response if isinstance(positions_response, dict) else {}
+                nested = payload.get("positions", {}) if isinstance(payload.get("positions"), dict) else {}
+                market_positions = (
+                    payload.get("market_positions")
+                    or nested.get("market_positions")
+                    or payload.get("event_positions")
+                    or nested.get("event_positions")
+                    or (payload.get("positions") if isinstance(payload.get("positions"), list) else [])
+                    or []
+                )
+                live_source = True
+            except Exception as exc:
+                st.warning(f"Live positions unavailable, using local DB positions: {exc}")
+                db_positions = await db_manager.get_open_positions()
+                market_positions = [
+                    {"ticker": p.market_id, "position": p.quantity if p.side == "YES" else -p.quantity, "entry_price": p.entry_price}
+                    for p in db_positions
+                ]
+                live_source = False
+
+            # Prefer direct Kalshi portfolio_value when present.
+            total_position_value = (portfolio_value_cents / 100.0) if portfolio_value_cents else 0.0
+            positions_count = 0
+            for p in market_positions:
+                raw_position = p.get('position', 0) or p.get('market_position', 0) or 0
+                raw_exposure = p.get('event_exposure_dollars', 0) or p.get('exposure_dollars', 0) or 0
+                try:
+                    if float(raw_position) != 0 or float(raw_exposure) != 0:
+                        positions_count += 1
+                except (TypeError, ValueError):
+                    continue
             
             # Calculate current value of all positions
             for position in market_positions:
                 try:
-                    ticker = position.get('ticker')
+                    ticker = position.get('ticker') or position.get('event_ticker') or position.get('market_ticker')
                     position_count = position.get('position', 0)
+                    if position_count == 0 and 'event_exposure_dollars' in position:
+                        # event_positions schema fallback; use exposure as proxy count
+                        position_count = float(position.get('event_exposure_dollars', 0))
                     
                     if ticker and position_count != 0:
+                        if not live_source:
+                            total_position_value += abs(position_count) * float(position.get("entry_price", 0.0))
+                            continue
+                        if portfolio_value_cents:
+                            # Already have authoritative position value from balance response.
+                            continue
+                        # event_positions already include exposure dollars; use it directly.
+                        if 'event_exposure_dollars' in position and position.get('position', 0) == 0:
+                            total_position_value += abs(float(position.get('event_exposure_dollars', 0) or 0))
+                            continue
                         # Get current market data
                         market_data = await kalshi_client.get_market(ticker)
                         if market_data and 'market' in market_data:
@@ -242,13 +360,15 @@ def load_system_health():
                     print(f"Warning: Could not value position {ticker}: {e}")
                     continue
             
-            # Total portfolio value = cash + position values
             total_portfolio_value = available_cash + total_position_value
-            
             return available_cash, total_portfolio_value, positions_count, total_position_value
-        
-        available_cash, total_portfolio_value, positions_count, position_value = loop.run_until_complete(get_health())
-        loop.close()
+            
+        try:
+            available_cash, total_portfolio_value, positions_count, position_value = loop.run_until_complete(get_health())
+        finally:
+            loop.run_until_complete(kalshi_client.close())
+            loop.run_until_complete(db_manager.close())
+            loop.close()
         
         return {
             'available_cash': available_cash,
@@ -359,6 +479,9 @@ def show_overview(performance_data, positions, system_health_data):
     
     with col2:
         total_trades = sum(stats.get('completed_trades', 0) for stats in performance_data.values()) if performance_data else 0
+        if total_trades == 0 and positions:
+            # Fallback signal that we still have meaningful live portfolio activity
+            total_trades = len(positions)
         st.metric(
             label="📈 Total Trades",
             value=total_trades,
@@ -368,6 +491,9 @@ def show_overview(performance_data, positions, system_health_data):
     with col3:
         # Calculate both realized and unrealized P&L
         realized_pnl = sum(stats.get('total_pnl', 0) for stats in performance_data.values()) if performance_data else 0
+        if realized_pnl == 0 and positions:
+            # Use live realized pnl exposure (event_positions) when trade_logs are empty.
+            realized_pnl = sum(float(pos.get('realized_pnl', 0) or 0) for pos in positions)
         
         # Calculate unrealized P&L from current positions
         unrealized_pnl = 0
@@ -392,9 +518,10 @@ def show_overview(performance_data, positions, system_health_data):
         )
     
     with col4:
+        active_positions_count = len(positions) if positions else int(system_health_data.get('positions_count', 0) or 0)
         st.metric(
             label="🎯 Active Positions",
-            value=len(positions) if positions else 0,
+            value=active_positions_count,
             help="Currently open positions"
         )
     

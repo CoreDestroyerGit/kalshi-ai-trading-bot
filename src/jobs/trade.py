@@ -141,7 +141,7 @@ async def _fallback_legacy_trading() -> Optional[TradingSystemResults]:
         # Get eligible markets
         markets = await db_manager.get_eligible_markets(
             volume_min=20000,  # Balanced volume for actual trading opportunities
-            max_days_to_expiry=365  # Accept any timeline with dynamic exits
+            max_days_to_expiry=settings.trading.max_time_to_expiry_days
         )
         if not markets:
             logger.warning("No eligible markets found")

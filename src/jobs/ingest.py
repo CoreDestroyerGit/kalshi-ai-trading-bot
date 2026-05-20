@@ -109,8 +109,7 @@ async def process_and_queue_markets(
             m
             for m in markets_to_upsert
             if m.volume >= min_volume
-            # REMOVED TIME RESTRICTION - we can now trade markets with ANY deadline!
-            # Dynamic exit strategies will handle timing automatically
+            and ((m.expiration_ts - time.time()) / 86400) <= settings.trading.max_time_to_expiry_days
             and (
                 not settings.trading.preferred_categories
                 or m.category in settings.trading.preferred_categories

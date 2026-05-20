@@ -656,7 +656,34 @@ class AdvancedPortfolioOptimizer:
             
             self.logger.info(f"Risk constraints applied. Total allocation: {total_allocation:.3f}")
             self.logger.info(f"Final constrained allocations: {constrained_allocation}")
-            
+
+            # If constraints removed everything (common with small accounts where
+            # min_position_size dominates tiny fractional allocations), keep a
+            # minimal, risk-capped starter allocation on highest-conviction names.
+            if not constrained_allocation and allocation:
+                min_fraction = self.min_position_size / max(self.total_capital, 1e-8)
+                # Respect max per-position cap and keep total small for safety.
+                if min_fraction <= self.max_position_fraction:
+                    ranked = sorted(
+                        allocation.items(),
+                        key=lambda kv: kv[1],
+                        reverse=True,
+                    )
+                    rescue_total_cap = min(0.30, 1.0)  # at most 30% of capital
+                    rescue_total = 0.0
+                    for market_id, _ in ranked:
+                        if rescue_total + min_fraction > rescue_total_cap:
+                            break
+                        constrained_allocation[market_id] = min_fraction
+                        rescue_total += min_fraction
+                    if constrained_allocation:
+                        self.logger.warning(
+                            "Risk constraints zeroed all allocations; applied rescue allocation.",
+                            min_fraction=min_fraction,
+                            rescue_total=rescue_total,
+                            positions=len(constrained_allocation),
+                        )
+
             return constrained_allocation
             
         except Exception as e:
@@ -829,7 +856,7 @@ async def create_market_opportunities_from_markets(
     opportunities = []
     
     # Limit markets to prevent excessive AI costs and focus on best opportunities
-    max_markets_to_analyze = 10  # REDUCED: More selective (was 20, now 10) to focus on highest quality
+    max_markets_to_analyze = int(getattr(settings.trading, "max_markets_for_ai_analysis", 30))
     if len(markets) > max_markets_to_analyze:
         # Sort by volume and take top markets
         markets = sorted(markets, key=lambda m: m.volume, reverse=True)[:max_markets_to_analyze]
@@ -877,7 +904,10 @@ async def create_market_opportunities_from_markets(
             from src.utils.edge_filter import EdgeFilter
             edge_result = EdgeFilter.calculate_edge(predicted_prob, market_prob, confidence)
             
-            if edge_result.passes_filter:  # Must pass 10% edge filter
+            min_edge_pct = float(getattr(settings.trading, "min_edge_percentage_filter", 0.05))
+            passes_edge_gate = edge_result.edge_percentage >= min_edge_pct
+            passes_quality_gate = bool(getattr(edge_result, "passes_filter", False))
+            if passes_edge_gate and passes_quality_gate:
                 opportunity = MarketOpportunity(
                     market_id=market.market_id,
                     market_title=market.title,
@@ -904,13 +934,23 @@ async def create_market_opportunities_from_markets(
                 opportunity.recommended_side = edge_result.side
                 
                 opportunities.append(opportunity)
-                logger.info(f"✅ EDGE APPROVED: {market.market_id} - Edge: {edge_result.edge_percentage:.1%} ({edge_result.side}), Confidence: {confidence:.1%}, Reason: {edge_result.reason}")
+                logger.info(
+                    f"✅ EDGE APPROVED: {market.market_id} - "
+                    f"Edge: {edge_result.edge_percentage:.1%} ({edge_result.side}), "
+                    f"Confidence: {confidence:.1%}, MinEdge: {min_edge_pct:.1%}, "
+                    f"Reason: {edge_result.reason}"
+                )
                 
                 # 🚀 IMMEDIATE TRADING: Place trade for strong opportunities
                 if db_manager:
                     await _evaluate_immediate_trade(opportunity, db_manager, kalshi_client, total_capital)
             else:
-                logger.info(f"❌ EDGE FILTERED: {market.market_id} - {edge_result.reason}")
+                gate_reason = []
+                if not passes_edge_gate:
+                    gate_reason.append(f"edge={edge_result.edge_percentage:.1%} < min={min_edge_pct:.1%}")
+                if not passes_quality_gate:
+                    gate_reason.append("quality gate failed")
+                logger.info(f"❌ EDGE FILTERED: {market.market_id} - {'; '.join(gate_reason)}; {edge_result.reason}")
             
         except Exception as e:
             logger.error(f"Error creating opportunity from {market.market_id}: {e}")
@@ -944,7 +984,7 @@ async def _evaluate_immediate_trade(
                 'volume': getattr(opportunity, 'volume', 1000),
                 'min_volume': 1000,
                 'time_to_expiry_days': opportunity.time_to_expiry,
-                'max_time_to_expiry': 365
+                'max_time_to_expiry': settings.trading.max_time_to_expiry_days
             }
         )
         
